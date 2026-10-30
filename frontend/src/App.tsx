@@ -4,13 +4,17 @@ import {
   Palette, Monitor, Package, CalendarCheck, PiggyBank,
   UserCheck, List, Key, Lock, Trash2, 
   X, CheckCircle2, ArrowRight, LogOut, Search, Loader2, AlertCircle, Eye, EyeOff, FolderOpen,  TrendingUp, DollarSign, Receipt, PieChart, Users, ChevronLeft, ChevronRight, FileText, Download, Calendar,
-  Banknote, QrCode, CreditCard, Calculator, FileSpreadsheet, Plus, Clock
+  Banknote, QrCode, CreditCard, Calculator, FileSpreadsheet, Plus, Clock,
+  Wifi, WifiOff, RefreshCw
 } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase } from './supabaseClient';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { dbLocal, type LocalVenda } from './db/localDb';
+import { syncService } from './services/syncService';
+import { useSyncStatus } from './hooks/useSyncStatus';
 
 const SETORES = [
   { id: 'MATERIAIS', label: 'MATERIAL', icon: Scissors, shortcut: 'F1' },
@@ -109,6 +113,14 @@ export default function App() {
   const [mensagemTrocaResultado, setMensagemTrocaResultado] = useState<string>('');
   const [erroLoginMsg, setErroLoginMsg] = useState<string | null>(null);
 
+  const syncState = useSyncStatus();
+
+  useEffect(() => {
+    if (logado) {
+      carregarStatus(unidade);
+    }
+  }, [syncState.lastSyncAt]);
+
   const [sidebarExpandida, setSidebarExpandida] = useState(true);
   
   const [calcDisplay, setCalcDisplay] = useState('0');
@@ -171,18 +183,25 @@ export default function App() {
   useEffect(() => {
     const verificarSessaoInicial = async () => {
       try {
-        const { data: { session } } = await supabase.auth.getSession();
-        if (session) {
-          const ultimoLoginData = localStorage.getItem('yama_ultimo_login_data');
-          const dataHoje = new Date().toISOString().split('T')[0];
+        const dataHoje = new Date().toISOString().split('T')[0];
+        const ultimoLoginData = localStorage.getItem('yama_ultimo_login_data');
 
-          if (ultimoLoginData && ultimoLoginData !== dataHoje) {
-            await supabase.auth.signOut();
-            localStorage.removeItem('yama_ultimo_login_data');
-            setLogado(false);
-            return;
-          }
+        if (ultimoLoginData && ultimoLoginData !== dataHoje) {
+          try { await supabase.auth.signOut(); } catch {}
+          localStorage.removeItem('yama_ultimo_login_data');
+          setLogado(false);
+          return;
+        }
 
+        let temSessao = false;
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session) temSessao = true;
+        } catch (authErr) {
+          console.warn("Verificação online de sessão falhou, checando cache local:", authErr);
+        }
+
+        if (temSessao || (ultimoLoginData && ultimoLoginData === dataHoje)) {
           setLogado(true);
           await carregarStatus(unidade);
         }
@@ -484,14 +503,38 @@ export default function App() {
     }
 
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: config.email,
-        password: senha
-      });
+      let autenticado = false;
 
-      if (error) {
-        setErroLoginMsg('Senha incorreta ou erro de autenticação.');
-        return;
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase.auth.signInWithPassword({
+            email: config.email,
+            password: senha
+          });
+
+          if (!error) {
+            autenticado = true;
+            try {
+              localStorage.setItem(`yama_offline_cred_${usuario}`, btoa(senha));
+            } catch {}
+          } else {
+            setErroLoginMsg('Senha incorreta ou erro de autenticação.');
+            return;
+          }
+        } catch (authErr) {
+          console.warn("Erro de rede no login online, testando cache offline:", authErr);
+        }
+      }
+
+      if (!autenticado) {
+        const credSalva = localStorage.getItem(`yama_offline_cred_${usuario}`);
+        if (credSalva && credSalva === btoa(senha)) {
+          autenticado = true;
+          dispararToast('Login efetuado em MODO OFFLINE!', 'aviso');
+        } else {
+          setErroLoginMsg('Senha incorreta ou sem conexão para o primeiro acesso.');
+          return;
+        }
       }
 
       const dataHoje = new Date().toISOString().split('T')[0];
@@ -507,7 +550,9 @@ export default function App() {
   };
 
   const fazerLogout = () => {
-    supabase.auth.signOut();
+    try {
+      supabase.auth.signOut();
+    } catch {}
     localStorage.removeItem('yama_ultimo_login_data');
     setLogado(false);
     setSenha('');
@@ -518,17 +563,41 @@ export default function App() {
 
   const carregarStatus = async (uni = unidade) => {
     try {
-      const { data: sessoes, error: errSessao } = await supabase
-        .from("caixa_sessoes")
-        .select("*")
-        .eq("unidade", uni)
-        .eq("status", "ABERTO")
-        .order("aberto_em", { ascending: false })
-        .limit(1);
+      let sessao: any = null;
 
-      if (errSessao) throw errSessao;
+      // 1. Tenta carregar sessão ativa online
+      if (navigator.onLine) {
+        try {
+          const { data: sessoes, error: errSessao } = await supabase
+            .from("caixa_sessoes")
+            .select("*")
+            .eq("unidade", uni)
+            .eq("status", "ABERTO")
+            .order("aberto_em", { ascending: false })
+            .limit(1);
 
-      const sessao = sessoes && sessoes.length > 0 ? sessoes[0] : null;
+          if (!errSessao && sessoes && sessoes.length > 0) {
+            sessao = sessoes[0];
+            await syncService.cacheSessao(sessao);
+          }
+        } catch (errOnline) {
+          console.warn("Falha ao buscar sessão online, buscando no cache local:", errOnline);
+        }
+      }
+
+      // Se não encontrou online ou está offline, busca no Dexie local
+      if (!sessao) {
+        const sessaoLocal = await dbLocal.sessoes
+          .where("unidade")
+          .equals(uni)
+          .and(s => s.status === "ABERTO")
+          .reverse()
+          .sortBy("aberto_em");
+
+        if (sessaoLocal && sessaoLocal.length > 0) {
+          sessao = sessaoLocal[0];
+        }
+      }
 
       if (!sessao) {
         setStatusCaixa({
@@ -537,17 +606,57 @@ export default function App() {
           trocoInicial: "0.00",
           caixa2Ativo: false,
           vendas: [],
-          totais: { totalVendas: 0.0, saldoCaixa: 0.0, totalClientesUnicos: 0, ticketMedio: 0.0, porSetor: {}, porPagamento: { DINHEIRO: 0, PIX: 0, DÉBITO: 0, CRÉDITO: 0 } }
+          totais: { totalVendas: 0.0, saldoCaixa: 0.0, repasseCaixa2: 0.0, totalClientesUnicos: 0, ticketMedio: 0.0, porSetor: {}, porPagamento: { DINHEIRO: 0, PIX: 0, DÉBITO: 0, CRÉDITO: 0 } }
         });
         setDadosVendasModal([]);
         return;
       }
 
-      const { data: vendasRaw } = await supabase
-        .from("vendas")
-        .select("*")
-        .eq("sessao_id", sessao.id)
-        .order("numero_sequencial", { ascending: true });
+      // 2. Carrega vendas: combina online e locais
+      let vendasRaw: any[] = [];
+      const sessaoIdStr = String(sessao.id);
+
+      if (navigator.onLine) {
+        try {
+          const { data, error: errVendas } = await supabase
+            .from("vendas")
+            .select("*")
+            .eq("sessao_id", sessao.id)
+            .order("numero_sequencial", { ascending: true });
+
+          if (!errVendas && data) {
+            vendasRaw = data;
+            await syncService.cacheVendas(data, sessaoIdStr);
+          }
+        } catch (errVendasOnline) {
+          console.warn("Falha ao buscar vendas online, buscando no cache local:", errVendasOnline);
+        }
+      }
+
+      // Busca vendas locais desta sessão (inclui pendentes e as que já foram cacheadas)
+      const vendasLocais = await dbLocal.vendas
+        .where("sessao_id")
+        .equals(sessaoIdStr)
+        .sortBy("numero_sequencial");
+
+      // Faz merge para garantir que nenhuma venda recente/offline seja perdida
+      if (vendasRaw.length === 0) {
+        vendasRaw = vendasLocais;
+      } else {
+        const idsVendasRaw = new Set(vendasRaw.map(v => String(v.id)));
+        vendasLocais.forEach(vl => {
+          if (!idsVendasRaw.has(String(vl.id))) {
+            vendasRaw.push(vl);
+          } else if (vl.sync_action === 'cancel' || vl.forma_pagto === 'CANCELADO') {
+            const idx = vendasRaw.findIndex(v => String(v.id) === String(vl.id));
+            if (idx >= 0) {
+              vendasRaw[idx].forma_pagto = 'CANCELADO';
+              vendasRaw[idx].observacao = vl.observacao;
+            }
+          }
+        });
+        vendasRaw.sort((a, b) => Number(a.numero_sequencial) - Number(b.numero_sequencial));
+      }
 
       let total_vendas = 0.0;
       let dinheiro_liquido = 0.0;
@@ -591,7 +700,7 @@ export default function App() {
             uuid: v.id,
             id: String(v.numero_sequencial).padStart(4, '0'),
             setor: setor,
-            hora: dataCriacao.toLocaleTimeString(),
+            hora: isNaN(dataCriacao.getTime()) ? '--:--:--' : dataCriacao.toLocaleTimeString(),
             valor: valor,
             valorFormatado: formatarMoedaPtBr(valor),
             pagamento: pagto,
@@ -628,7 +737,7 @@ export default function App() {
       setStatusCaixa(statusObj);
       setDadosVendasModal(vendas_formatadas);
     } catch (err) {
-      console.error(err);
+      console.error("Erro ao carregar status do caixa:", err);
     }
   };
 
@@ -650,15 +759,52 @@ export default function App() {
     setCarregando(true);
     try {
       const valorTroco = parseFloat(trocoInput.replace(',', '.')) || 0;
-      const { error } = await supabase
-        .from("caixa_sessoes")
-        .insert([{ unidade, status: "ABERTO", troco_inicial: valorTroco, caixa_2_ativo: false }]);
+      const novoId = crypto.randomUUID();
+      const agora = new Date().toISOString();
 
-      if (error) throw error;
+      let gravadoOnline = false;
 
+      if (navigator.onLine) {
+        try {
+          const { data, error } = await supabase
+            .from("caixa_sessoes")
+            .insert([{ unidade, status: "ABERTO", troco_inicial: valorTroco, caixa_2_ativo: false }])
+            .select()
+            .single();
+
+          if (!error && data) {
+            gravadoOnline = true;
+            await dbLocal.sessoes.put({
+              id: String(data.id),
+              unidade: data.unidade,
+              status: data.status,
+              troco_inicial: Number(data.troco_inicial) || 0,
+              caixa_2_ativo: !!data.caixa_2_ativo,
+              aberto_em: data.aberto_em,
+              sync_status: 'synced'
+            });
+          }
+        } catch (e) {
+          console.warn("Erro ao abrir caixa no Supabase, abrindo offline:", e);
+        }
+      }
+
+      if (!gravadoOnline) {
+        await dbLocal.sessoes.put({
+          id: novoId,
+          unidade: unidade,
+          status: "ABERTO",
+          troco_inicial: valorTroco,
+          caixa_2_ativo: false,
+          aberto_em: agora,
+          sync_status: 'pending'
+        });
+      }
+
+      await syncService.contarPendentes();
       await carregarStatus(unidade);
       setModalAberto(null);
-      dispararToast('Caixa aberto com sucesso!', 'sucesso');
+      dispararToast(gravadoOnline ? 'Caixa aberto com sucesso!' : 'Caixa aberto em modo offline!', 'sucesso');
     } catch (err) {
       alert('Erro ao abrir caixa.');
     } finally {
@@ -807,9 +953,20 @@ export default function App() {
       const nomeResumo = `${dataCaixaFormatada}.pdf`;
       const caminhoResumo = `${unidadeLower}/resumo/${nomeResumo}`;
 
-      await supabase.storage
-        .from('relatorios')
-        .upload(caminhoResumo, blobResumo, { contentType: 'application/pdf', upsert: true });
+      // Uploads dos relatórios (tenta online; se offline, enfileira localmente)
+      let uploadResumoOk = false;
+      let uploadVendasOk = false;
+
+      if (navigator.onLine) {
+        try {
+          const { error: err1 } = await supabase.storage
+            .from('relatorios')
+            .upload(caminhoResumo, blobResumo, { contentType: 'application/pdf', upsert: true });
+          if (!err1) uploadResumoOk = true;
+        } catch (e) {
+          console.warn("Upload resumo online falhou:", e);
+        }
+      }
 
       // ==========================================
       // 2. GERAR E GUARDAR PDF DE VENDAS DETALHADAS (dd_mm_aa-V.pdf)
@@ -861,19 +1018,61 @@ export default function App() {
       const nomeVendas = `${dataCaixaFormatada}-V.pdf`;
       const caminhoVendas = `${unidadeLower}/vendas/${nomeVendas}`;
 
-      await supabase.storage
-        .from('relatorios')
-        .upload(caminhoVendas, blobVendas, { contentType: 'application/pdf', upsert: true });
+      if (navigator.onLine) {
+        try {
+          const { error: err2 } = await supabase.storage
+            .from('relatorios')
+            .upload(caminhoVendas, blobVendas, { contentType: 'application/pdf', upsert: true });
+          if (!err2) uploadVendasOk = true;
+        } catch (e) {
+          console.warn("Upload vendas online falhou:", e);
+        }
+      }
+
+      if (!uploadResumoOk) {
+        await dbLocal.storageQueue.add({
+          bucket: 'relatorios',
+          caminho: caminhoResumo,
+          blob: blobResumo,
+          contentType: 'application/pdf',
+          criado_em: new Date().toISOString()
+        });
+      }
+
+      if (!uploadVendasOk) {
+        await dbLocal.storageQueue.add({
+          bucket: 'relatorios',
+          caminho: caminhoVendas,
+          blob: blobVendas,
+          contentType: 'application/pdf',
+          criado_em: new Date().toISOString()
+        });
+      }
 
       // ==========================================
       // 3. ATUALIZAR STATUS NO BANCO PARA FECHADO
       // ==========================================
-      const { error } = await supabase
-        .from("caixa_sessoes")
-        .update({ status: "FECHADO", fechado_em: new Date().toISOString() })
-        .eq("id", statusCaixa.sessaoId);
+      const agoraFechadoIso = new Date().toISOString();
+      let sessaoFechadaOnline = false;
 
-      if (error) throw error;
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from("caixa_sessoes")
+            .update({ status: "FECHADO", fechado_em: agoraFechadoIso })
+            .eq("id", statusCaixa.sessaoId);
+
+          if (!error) sessaoFechadaOnline = true;
+        } catch (errSessao) {
+          console.warn("Fechamento online de sessão falhou:", errSessao);
+        }
+      }
+
+      await dbLocal.sessoes.update(String(statusCaixa.sessaoId), {
+        status: "FECHADO",
+        fechado_em: agoraFechadoIso,
+        sync_status: sessaoFechadaOnline ? 'synced' : 'pending'
+      });
 
       const urlResumo = URL.createObjectURL(blobResumo);
       setLinkResumoRecente({
@@ -883,6 +1082,7 @@ export default function App() {
 
       setMensagemSucesso(`O relatório de resumo foi gerado como ${nomeResumo}.`);
       setModalAberto('sucesso_fechamento');
+      await syncService.contarPendentes();
       await carregarStatus();
       dispararToast('Caixa fechado e relatório guardado!', 'sucesso');
     } catch (err: any) {
@@ -899,26 +1099,46 @@ export default function App() {
     try {
       if (!statusCaixa.sessaoId) return;
 
-      if (acao === 'iniciar') {
-        const { error } = await supabase
-          .from("caixa_sessoes")
-          .update({ caixa_2_ativo: true })
-          .eq("id", statusCaixa.sessaoId);
+      const isIniciar = acao === 'iniciar';
+      const repasse = statusCaixa.totais?.repasseCaixa2 || 0;
 
-        if (error) throw error;
+      let onlineOk = false;
+      if (navigator.onLine) {
+        try {
+          if (isIniciar) {
+            const { error } = await supabase
+              .from("caixa_sessoes")
+              .update({ caixa_2_ativo: true })
+              .eq("id", statusCaixa.sessaoId);
+
+            if (!error) onlineOk = true;
+          } else {
+            const { error } = await supabase
+              .from("caixa_sessoes")
+              .update({ caixa_2_ativo: false, repasse_caixa_2: repasse })
+              .eq("id", statusCaixa.sessaoId);
+
+            if (!error) onlineOk = true;
+          }
+        } catch (errTroca) {
+          console.warn("Troca de caixa online falhou:", errTroca);
+        }
+      }
+
+      await dbLocal.sessoes.update(String(statusCaixa.sessaoId), {
+        caixa_2_ativo: isIniciar,
+        ...(isIniciar ? {} : { repasse_caixa_2: repasse }),
+        sync_status: onlineOk ? 'synced' : 'pending'
+      });
+
+      if (isIniciar) {
         setMensagemTrocaResultado("2º CAIXA iniciado com sucesso!\n\nAs próximas vendas serão registradas no 2º CAIXA com troco fixo base de R$ 375,00.");
       } else {
-        const repasse = statusCaixa.totais?.repasseCaixa2 || 0;
-        const { error } = await supabase
-          .from("caixa_sessoes")
-          .update({ caixa_2_ativo: false, repasse_caixa_2: repasse })
-          .eq("id", statusCaixa.sessaoId);
-
-        if (error) throw error;
         setMensagemTrocaResultado(`TROCA FINALIZADA!\n\nVALOR PARA REPASSE AO CAIXA PRINCIPAL: R$ ${repasse.toFixed(2).replace('.', ',')}`);
       }
 
       setModalAberto('sucesso_troca');
+      await syncService.contarPendentes();
       await carregarStatus();
     } catch (err) {
       alert('Erro na troca de caixa.');
@@ -1020,34 +1240,91 @@ export default function App() {
     setSetorAtivo(null);
 
     try {
-      const { data: ultimas } = await supabase
-        .from("vendas")
-        .select("numero_sequencial")
-        .eq("sessao_id", statusCaixa.sessaoId)
-        .order("numero_sequencial", { ascending: false })
-        .limit(1);
+      const sessaoIdStr = String(statusCaixa.sessaoId);
 
-      const proximoSeq = ultimas && ultimas.length > 0 ? ultimas[0].numero_sequencial + 1 : 1;
+      // Determina próximo sequencial combinando histórico local e online
+      const vendasLocais = await dbLocal.vendas.where("sessao_id").equals(sessaoIdStr).toArray();
+      let maxSeq = vendasLocais.reduce((max, v) => Math.max(max, Number(v.numero_sequencial) || 0), 0);
+
+      if (navigator.onLine) {
+        try {
+          const { data: ultimas } = await supabase
+            .from("vendas")
+            .select("numero_sequencial")
+            .eq("sessao_id", statusCaixa.sessaoId)
+            .order("numero_sequencial", { ascending: false })
+            .limit(1);
+
+          if (ultimas && ultimas.length > 0) {
+            maxSeq = Math.max(maxSeq, Number(ultimas[0].numero_sequencial) || 0);
+          }
+        } catch (e) {
+          console.warn("Consulta online de sequencial falhou, usando base local:", e);
+        }
+      }
+
+      const proximoSeq = maxSeq + 1;
       const isC2 = statusCaixa.caixa2Ativo;
 
-      const linhasInserir = itensParaEnviar.map(item => ({
-        sessao_id: statusCaixa.sessaoId,
+      const novosRegistros: LocalVenda[] = itensParaEnviar.map(item => ({
+        id: crypto.randomUUID(),
+        sessao_id: sessaoIdStr,
         unidade: unidade,
         numero_sequencial: proximoSeq,
         setor: item.setor,
-        valor: item.valor,
-        quantidade: item.qtd,
+        valor: Number(item.valor),
+        quantidade: Number(item.qtd),
         forma_pagto: formaPagto,
         observacao: isC2 ? `[2º CAIXA] ${item.obs || ''}`.trim() : (item.obs || ''),
-        is_caixa_2: isC2
+        is_caixa_2: isC2,
+        criado_em: new Date().toISOString(),
+        sync_status: 'pending',
+        sync_action: 'insert'
       }));
 
-      const { error } = await supabase.from("vendas").insert(linhasInserir);
-      if (error) throw error;
+      // 1. Salva imediatamente no banco local Dexie
+      await dbLocal.vendas.bulkPut(novosRegistros);
 
-      dispararToast('Venda registrada com sucesso!', 'sucesso');
+      // 2. Se houver conexão, tenta enviar ao Supabase imediatamente
+      let sincronizado = false;
+      if (navigator.onLine) {
+        try {
+          const linhasInserir = novosRegistros.map(r => ({
+            id: r.id,
+            sessao_id: r.sessao_id,
+            unidade: r.unidade,
+            numero_sequencial: r.numero_sequencial,
+            setor: r.setor,
+            valor: r.valor,
+            quantidade: r.quantidade,
+            forma_pagto: r.forma_pagto,
+            observacao: r.observacao,
+            is_caixa_2: r.is_caixa_2,
+            criado_em: r.criado_em
+          }));
+
+          const { error } = await supabase.from("vendas").insert(linhasInserir);
+          if (!error) {
+            sincronizado = true;
+            for (const r of novosRegistros) {
+              await dbLocal.vendas.update(r.id, { sync_status: 'synced', sync_action: undefined });
+            }
+          }
+        } catch (syncErr) {
+          console.warn("Envio imediato ao Supabase falhou, mantendo na fila local:", syncErr);
+        }
+      }
+
+      if (sincronizado) {
+        dispararToast('Venda registrada com sucesso!', 'sucesso');
+      } else {
+        dispararToast('Venda salva localmente (Modo Offline)!', 'aviso');
+      }
+
+      await syncService.contarPendentes();
       await carregarStatus();
     } catch (err) {
+      console.error('Erro ao registrar venda:', err);
       alert('Erro ao registrar venda.');
     }
   };
@@ -1059,18 +1336,39 @@ export default function App() {
     }
     setCarregando(true);
     try {
-      const { error } = await supabase
-        .from("vendas")
-        .update({ forma_pagto: "CANCELADO", observacao: motivoCancelamento.trim() })
-        .eq("id", vendaParaCancelar.uuid);
+      const vendaId = vendaParaCancelar.uuid;
+      const motivo = motivoCancelamento.trim();
 
-      if (error) throw error;
+      // Atualiza localmente
+      await dbLocal.vendas.update(vendaId, {
+        forma_pagto: "CANCELADO",
+        observacao: motivo,
+        sync_status: 'pending',
+        sync_action: 'cancel'
+      });
+
+      // Tenta atualizar no Supabase se online
+      if (navigator.onLine) {
+        try {
+          const { error } = await supabase
+            .from("vendas")
+            .update({ forma_pagto: "CANCELADO", observacao: motivo })
+            .eq("id", vendaId);
+
+          if (!error) {
+            await dbLocal.vendas.update(vendaId, { sync_status: 'synced', sync_action: undefined });
+          }
+        } catch (e) {
+          console.warn("Cancelamento mantido na fila local:", e);
+        }
+      }
 
       setVendaParaCancelar(null);
       setMotivoCancelamento('');
       setSucessoExclusaoMsg('Venda excluída com sucesso.');
       dispararToast('VENDA EXCLUÍDA / CANCELADA', 'retirada');
       
+      await syncService.contarPendentes();
       await carregarStatus();
     } catch (err) {
       alert('Erro ao excluir venda.');
@@ -1436,6 +1734,43 @@ export default function App() {
                 {statusCaixa.caixa2Ativo ? 'ALMOÇO' : 'CAIXA PRINCIPAL'}
               </span>
             </div>
+          </div>
+
+          {/* INDICADOR DE CONEXÃO E SINCRONIZAÇÃO OFFLINE */}
+          <div className="flex items-center gap-3">
+            {!syncState.isOnline ? (
+              <div 
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-50 border border-amber-300 text-amber-800 text-xs font-black shadow-2xs tracking-wide"
+                title="Sem conexão de internet. As vendas e registros estão sendo salvos com segurança no armazenamento local e serão enviados assim que a internet voltar."
+              >
+                <WifiOff className="w-4 h-4 text-amber-600 animate-pulse" />
+                <span>MODO OFFLINE {syncState.pendingCount > 0 ? `(${syncState.pendingCount} pendente${syncState.pendingCount > 1 ? 's' : ''})` : ''}</span>
+              </div>
+            ) : syncState.isSyncing ? (
+              <div 
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-sky-50 border border-sky-300 text-sky-800 text-xs font-black shadow-2xs tracking-wide"
+              >
+                <RefreshCw className="w-4 h-4 text-sky-600 animate-spin" />
+                <span>SINCRONIZANDO DADOS...</span>
+              </div>
+            ) : syncState.pendingCount > 0 ? (
+              <button 
+                onClick={syncState.forcarSincronizacao}
+                title="Existem registros salvos localmente aguardando envio. Clique para sincronizar agora."
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-black shadow-2xs transition-all cursor-pointer active:scale-95"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>SINCRONIZAR AGORA ({syncState.pendingCount})</span>
+              </button>
+            ) : (
+              <div 
+                className="flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-50 border border-emerald-300 text-emerald-800 text-xs font-black shadow-2xs tracking-wide"
+                title="Conectado ao servidor e com todos os dados sincronizados."
+              >
+                <Wifi className="w-4 h-4 text-emerald-600" />
+                <span>ONLINE E SINCRONIZADO</span>
+              </div>
+            )}
           </div>
         </header>
 
