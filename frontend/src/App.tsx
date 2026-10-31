@@ -27,7 +27,7 @@ const SETORES = [
   { id: 'GRÁFICA', label: 'GRÁFICA', icon: Palette, shortcut: 'F8' },
   { id: 'INFORMÁTICA', label: 'INFORMÁTICA', icon: Monitor, shortcut: 'F9' },
   { id: 'PACOTE', label: 'PACOTE', icon: Package, shortcut: 'F10' },
-  { id: 'MENSALISTA', label: 'MENSALISTA', icon: CalendarCheck, shortcut: 'F11', reqObs: true },
+  { id: 'MENSALISTA', label: 'MENSALISTA', icon: CalendarCheck, shortcut: 'F11', reqObs: true, isMensalista: true },
   { id: 'RETIRADA', label: 'RETIRADA', icon: PiggyBank, shortcut: 'F12', reqObs: true, isDanger: true },
 ];
 
@@ -104,7 +104,7 @@ export default function App() {
   
   const [precoInput, setPrecoInput] = useState<string>('0');
   const [qtd, setQtd] = useState<number>(1);
-  const [carrinho, setCarrinho] = useState<Array<{ setor: string; valor: number; qtd: number; obs: string }>>([]);
+  const [carrinho, setCarrinho] = useState<Array<{ id?: string; setor: string; valor: number; qtd: number; obs: string }>>([]);
 
   const [modalAberto, setModalAberto] = useState<string | null>(null);
   const [trocoInput, setTrocoInput] = useState<string>('100.00');
@@ -148,10 +148,10 @@ export default function App() {
 
   const dispararToast = (mensagem: string, tipo: 'sucesso' | 'erro' | 'aviso' | 'retirada' | 'neutro' = 'sucesso') => {
     const id = ++contadorToastRef.current;
-    setToasts(prev => [...prev, { id, mensagem, tipo }]);
+    setToasts(prev => [...prev.slice(-1), { id, mensagem, tipo }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
-    }, 3500);
+    }, 2600);
   };
 
   const [dataSelecionadaResumo, setDataSelecionadaResumo] = useState<string>(() => {
@@ -1171,14 +1171,12 @@ export default function App() {
       return;
     }
 
-    setCarrinho(prev => [...prev, { setor: setorAtivo, valor: valorNum, qtd, obs: '' }]);
-    
-    if (setorAtivo === 'RETIRADA') {
-      dispararToast(`ITEM ${setorAtivo} ADICIONADO!`, 'retirada');
-    } else {
-      dispararToast(`ITEM ${setorAtivo} ADICIONADO!`, 'neutro');
-    }
+    const valorTotalItem = valorNum * qtd;
+    const textoQtd = qtd > 1 ? ` (${qtd}x)` : '';
+    dispararToast(`${setorAtivo}${textoQtd} · R$ ${valorTotalItem.toFixed(2).replace('.', ',')}`, 'sucesso');
 
+    setCarrinho(prev => [...prev, { id: crypto.randomUUID(), setor: setorAtivo, valor: valorNum, qtd, obs: '' }]);
+    
     setSetorAtivo(null);
     setPrecoInput('0');
     setQtd(1);
@@ -1190,7 +1188,13 @@ export default function App() {
       return;
     }
     if (pendenteRetirada && setorAtivo) {
+      const valorTotalItem = pendenteRetirada.valor * pendenteRetirada.qtd;
+      const textoQtd = pendenteRetirada.qtd > 1 ? ` (${pendenteRetirada.qtd}x)` : '';
+      const isRet = setorAtivo === 'RETIRADA';
+      dispararToast(`${setorAtivo}${textoQtd} · R$ ${valorTotalItem.toFixed(2).replace('.', ',')}`, isRet ? 'retirada' : 'sucesso');
+
       setCarrinho(prev => [...prev, { 
+        id: crypto.randomUUID(),
         setor: setorAtivo, 
         valor: pendenteRetirada.valor, 
         qtd: pendenteRetirada.qtd, 
@@ -1198,19 +1202,12 @@ export default function App() {
       }]);
     }
     
-    const isRet = setorAtivo === 'RETIRADA';
     setPendenteRetirada(null);
     setObsRetiradaInput('');
     setSetorAtivo(null);
     setPrecoInput('0');
     setQtd(1);
     setModalAberto(null);
-
-    if (isRet) {
-      dispararToast('RETIRADA REGISTRADA NO CARRINHO.', 'retirada');
-    } else {
-      dispararToast('Lançamento registrado no carrinho.', 'neutro');
-    }
   };
 
   const finalizarVenda = async (formaPagto: string) => {
@@ -1235,9 +1232,17 @@ export default function App() {
       return;
     }
 
+    const isRetirada = carrinho.some(i => i.setor === 'RETIRADA');
     const itensParaEnviar = [...carrinho];
     setCarrinho([]);
     setSetorAtivo(null);
+
+    // DISPARO INSTANTÂNEO DO TOAST (FEEDBACK ZERO DELAY)
+    if (isRetirada) {
+      dispararToast('RETIRADA EFETUADA', 'retirada');
+    } else {
+      dispararToast('VENDA REGISTRADA', 'sucesso');
+    }
 
     try {
       const sessaoIdStr = String(statusCaixa.sessaoId);
@@ -1286,7 +1291,6 @@ export default function App() {
       await dbLocal.vendas.bulkPut(novosRegistros);
 
       // 2. Se houver conexão, tenta enviar ao Supabase imediatamente
-      let sincronizado = false;
       if (navigator.onLine) {
         try {
           const linhasInserir = novosRegistros.map(r => ({
@@ -1305,7 +1309,6 @@ export default function App() {
 
           const { error } = await supabase.from("vendas").insert(linhasInserir);
           if (!error) {
-            sincronizado = true;
             for (const r of novosRegistros) {
               await dbLocal.vendas.update(r.id, { sync_status: 'synced', sync_action: undefined });
             }
@@ -1313,12 +1316,6 @@ export default function App() {
         } catch (syncErr) {
           console.warn("Envio imediato ao Supabase falhou, mantendo na fila local:", syncErr);
         }
-      }
-
-      if (sincronizado) {
-        dispararToast('Venda registrada com sucesso!', 'sucesso');
-      } else {
-        dispararToast('Venda salva localmente (Modo Offline)!', 'aviso');
       }
 
       await syncService.contarPendentes();
@@ -1470,33 +1467,6 @@ export default function App() {
   return (
     <div className="flex h-screen bg-slate-100 text-slate-800 select-none overflow-hidden font-sans">
       
-      {/* TOASTS INSTANTÂNEOS EM PILHA */}
-      <div className="fixed top-5 right-5 z-50 flex flex-col gap-2.5 pointer-events-none max-w-sm w-full">
-        <AnimatePresence>
-          {toasts.map((t) => (
-            <motion.div
-              key={t.id}
-              layout
-              initial={{ opacity: 0, y: -10, scale: 0.98 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.1 } }}
-              transition={{ type: "spring", stiffness: 600, damping: 35 }}
-              className="pointer-events-auto flex items-center gap-2.5 px-4 py-3 rounded-2xl shadow-xl border text-white font-black text-xs uppercase tracking-wider backdrop-blur-md"
-              style={{
-                background: t.tipo === 'sucesso' ? 'rgba(5, 150, 105, 0.95)' : t.tipo === 'retirada' || t.tipo === 'erro' ? 'rgba(225, 29, 72, 0.95)' : t.tipo === 'neutro' ? 'rgba(15, 23, 42, 0.95)' : 'rgba(217, 119, 6, 0.95)',
-                borderColor: 'rgba(255,255,255,0.3)'
-              }}
-            >
-              {t.tipo === 'sucesso' && <CheckCircle2 className="w-4 h-4 text-emerald-200 shrink-0" />}
-              {(t.tipo === 'retirada' || t.tipo === 'erro') && <AlertCircle className="w-4 h-4 text-rose-200 shrink-0" />}
-              {t.tipo === 'aviso' && <AlertCircle className="w-4 h-4 text-amber-200 shrink-0" />}
-              {t.tipo === 'neutro' && <CheckCircle2 className="w-4 h-4 text-sky-300 shrink-0" />}
-              <span className="truncate">{t.mensagem}</span>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
-
       {/* SIDEBAR COM TOPO PERFEITAMENTE ALINHADO */}
       <motion.aside 
         animate={{ width: sidebarExpandida ? 250 : 80 }}
@@ -1707,68 +1677,83 @@ export default function App() {
 
       <div className="flex-1 flex flex-col h-screen overflow-hidden">
         
-        <header className="flex items-center justify-between px-6 py-3.5 bg-white border-b border-slate-200 shadow-2xs z-10 h-18">
-          <div className="flex items-center gap-6 text-xs font-medium">
-            <div className="flex items-center gap-2.5">
-              <span className="text-slate-400 font-bold">STATUS:</span>
-              <div className="flex items-center gap-2">
-                <span className={` font-extrabold px-6 py-3 rounded-full shadow-2xs ${caixaAberto ? 'bg-emerald-100 text-emerald-700 border border-emerald-200' : 'bg-rose-100 text-rose-700 border border-rose-200'}`}>
-                  {statusCaixa.status.toUpperCase()}
-                </span>
-                <span className="relative flex h-3 w-3">
+        <header className="h-18 flex items-center justify-between gap-3 px-4 sm:px-6 bg-white border-b border-slate-200 shadow-2xs z-10 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-2.5 text-xs">
+            {/* STATUS DO CAIXA */}
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50/90 border border-slate-200/80 shadow-2xs shrink-0">
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Status</span>
+              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-lg text-xs font-black tracking-wide ${caixaAberto ? 'bg-emerald-500/10 text-emerald-700 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-700 border border-rose-500/20'}`}>
+                <span className="relative flex h-2 w-2">
                   <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${caixaAberto ? 'bg-emerald-400' : 'bg-rose-400'}`}></span>
-                  <span className={`relative inline-flex rounded-full h-3 w-3 ${caixaAberto ? 'bg-emerald-500' : 'bg-rose-500'} shadow-sm`}></span>
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${caixaAberto ? 'bg-emerald-500' : 'bg-rose-500'}`}></span>
                 </span>
+                {statusCaixa.status.toUpperCase()}
+              </span>
+            </div>
+
+            {/* DATA E HORA DE ABERTURA */}
+            <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50/90 border border-slate-200/80 shadow-2xs shrink-0">
+              <Clock className="w-3.5 h-3.5 text-slate-400" />
+              <div className="flex flex-col">
+                <span className="text-[9px] font-bold text-slate-400 uppercase leading-none">Abertura</span>
+                <span className="text-xs font-black text-slate-700 leading-tight">{statusCaixa.dataHora}</span>
               </div>
             </div>
 
-            <div className="h-4 w-px bg-slate-200" />
-            <div><span className="text-slate-400 font-bold">DATA/HORA:</span> <strong className="text-slate-700">{statusCaixa.dataHora}</strong></div>
-            <div className="h-4 w-px bg-slate-200" />
-            <div><span className="text-slate-400 font-bold">TROCO INICIAL:</span> <strong className="text-emerald-600">R$ {statusCaixa.trocoInicial}</strong></div>
-            <div className="h-4 w-px bg-slate-200" />
-            
-            <div className="flex items-center gap-2">
-              <span className="text-slate-400 font-bold">OPERAÇÃO:</span>
-              <span className={`font-extrabold px-6 py-3 rounded-full border shadow-2xs ${statusCaixa.caixa2Ativo ? 'bg-purple-100 text-purple-700 border-purple-200' : 'bg-emerald-100 text-emerald-700 border-emerald-200' }`}>
+            {/* TROCO INICIAL */}
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50/90 border border-slate-200/80 shadow-2xs shrink-0">
+              <Banknote className="w-3.5 h-3.5 text-emerald-600" />
+              <div className="flex flex-col">
+                <span className="text-[9px] font-bold text-slate-400 uppercase leading-none">Troco Inicial</span>
+                <span className="text-xs font-black text-emerald-600 leading-tight">R$ {statusCaixa.trocoInicial}</span>
+              </div>
+            </div>
+
+            {/* TIPO DE OPERAÇÃO */}
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50/90 border border-slate-200/80 shadow-2xs shrink-0">
+              <span className="text-[9px] font-bold text-slate-400 uppercase leading-none">Operação</span>
+              <span className={`px-2.5 py-0.5 rounded-lg text-xs font-black tracking-wide ${statusCaixa.caixa2Ativo ? 'bg-purple-500/10 text-purple-700 border border-purple-500/20' : 'bg-emerald-500/10 text-emerald-700 border border-emerald-500/20'}`}>
                 {statusCaixa.caixa2Ativo ? 'ALMOÇO' : 'CAIXA PRINCIPAL'}
               </span>
             </div>
           </div>
 
           {/* INDICADOR DE CONEXÃO E SINCRONIZAÇÃO OFFLINE */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 shrink-0">
             {!syncState.isOnline ? (
               <div 
-                className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-50 border border-amber-300 text-amber-800 text-xs font-black shadow-2xs tracking-wide"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-800 text-xs font-black shadow-2xs tracking-wide"
                 title="Sem conexão de internet. As vendas e registros estão sendo salvos com segurança no armazenamento local e serão enviados assim que a internet voltar."
               >
-                <WifiOff className="w-4 h-4 text-amber-600 animate-pulse" />
-                <span>MODO OFFLINE {syncState.pendingCount > 0 ? `(${syncState.pendingCount} pendente${syncState.pendingCount > 1 ? 's' : ''})` : ''}</span>
+                <WifiOff className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+                <span className="hidden md:inline">MODO OFFLINE</span>
+                {syncState.pendingCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-md bg-amber-200/80 text-[10px] text-amber-950 font-extrabold">{syncState.pendingCount} pendente{syncState.pendingCount > 1 ? 's' : ''}</span>
+                )}
               </div>
             ) : syncState.isSyncing ? (
               <div 
-                className="flex items-center gap-2 px-4 py-2 rounded-full bg-sky-50 border border-sky-300 text-sky-800 text-xs font-black shadow-2xs tracking-wide"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-800 text-xs font-black shadow-2xs tracking-wide"
               >
-                <RefreshCw className="w-4 h-4 text-sky-600 animate-spin" />
-                <span>SINCRONIZANDO DADOS...</span>
+                <RefreshCw className="w-3.5 h-3.5 text-sky-600 animate-spin" />
+                <span className="hidden md:inline">SINCRONIZANDO...</span>
               </div>
             ) : syncState.pendingCount > 0 ? (
               <button 
                 onClick={syncState.forcarSincronizacao}
                 title="Existem registros salvos localmente aguardando envio. Clique para sincronizar agora."
-                className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500 hover:bg-amber-600 text-white text-xs font-black shadow-2xs transition-all cursor-pointer active:scale-95"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white text-xs font-black shadow-xs transition-all cursor-pointer active:scale-95"
               >
-                <RefreshCw className="w-4 h-4" />
-                <span>SINCRONIZAR AGORA ({syncState.pendingCount})</span>
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>SINCRONIZAR ({syncState.pendingCount})</span>
               </button>
             ) : (
               <div 
-                className="flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-50 border border-emerald-300 text-emerald-800 text-xs font-black shadow-2xs tracking-wide"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-800 text-xs font-black shadow-2xs tracking-wide"
                 title="Conectado ao servidor e com todos os dados sincronizados."
               >
-                <Wifi className="w-4 h-4 text-emerald-600" />
-                <span>ONLINE E SINCRONIZADO</span>
+                <Wifi className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="hidden md:inline">ONLINE E SINCRONIZADO</span>
               </div>
             )}
           </div>
@@ -1787,12 +1772,28 @@ export default function App() {
                     onClick={() => selecionarSetorDinamico(s.id)}
                     className={`group relative flex items-center px-4 py-3.5 rounded-2xl border text-xs font-extrabold transition-all cursor-pointer shadow-sm hover:shadow-md active:scale-95 ${
                       ativo 
-                        ? (s.isDanger ? 'bg-rose-600 text-white border-rose-600 ring-4 ring-rose-600/20 shadow-rose-500/30' : 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-500 ring-4 ring-sky-500/20 shadow-sky-500/20') 
-                        : (s.isDanger ? 'bg-white text-slate-700 border-rose-200 hover:bg-rose-50/80' : 'bg-white text-slate-700 border-slate-200/90 hover:bg-sky-50/50')
+                        ? (s.isDanger 
+                            ? 'bg-rose-600 text-white border-rose-600 ring-4 ring-rose-600/20 shadow-rose-500/30' 
+                            : s.isMensalista
+                            ? 'bg-emerald-800 text-white border-emerald-800 ring-4 ring-emerald-800/20 shadow-emerald-950/30'
+                            : 'bg-gradient-to-br from-sky-600 to-blue-700 text-white border-sky-500 ring-4 ring-sky-500/20 shadow-sky-500/20') 
+                        : (s.isDanger 
+                            ? 'bg-white text-slate-700 border-rose-200 hover:bg-rose-50/80' 
+                            : s.isMensalista
+                            ? 'bg-white text-slate-700 border-emerald-300/80 hover:bg-emerald-50/80'
+                            : 'bg-white text-slate-700 border-slate-200/90 hover:bg-sky-50/50')
                     }`}
                   >
                     <span className={`absolute top-2.5 right-3 text-[9px] font-black px-1.5 py-0.5 rounded-md ${ativo ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-400'}`}>{s.shortcut}</span>
-                    <div className={`p-2.5 rounded-xl mr-3.5 shrink-0 transition-transform group-hover:scale-110 ${ativo ? 'bg-white/20 text-white' : s.isDanger ? 'bg-rose-50 text-rose-600' : 'bg-slate-100 text-sky-600'}`}>
+                    <div className={`p-2.5 rounded-xl mr-3.5 shrink-0 transition-transform group-hover:scale-110 ${
+                      ativo 
+                        ? 'bg-white/20 text-white' 
+                        : s.isDanger 
+                        ? 'bg-rose-50 text-rose-600' 
+                        : s.isMensalista
+                        ? 'bg-emerald-50 text-emerald-800'
+                        : 'bg-slate-100 text-sky-600'
+                    }`}>
                       <Icon className="w-5 h-5" />
                     </div>
                     <span className="tracking-tight text-left text-xs font-black truncate">{s.label}</span>
@@ -1802,15 +1803,8 @@ export default function App() {
             </div>
           </div>
 
-          <div className="w-[58%] flex flex-col gap-5 h-full">
+          <div className="w-[58%] flex flex-col gap-4 h-full">
             
-            <div className="bg-white border border-slate-200/90 rounded-2xl px-6 py-4 flex items-center justify-between shadow-sm shrink-0">
-              <div>
-                <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest block mb-0.5">Item em Registro</span>
-                <span className="text-base font-black text-sky-600 tracking-wide">{setorAtivo || 'Nenhum selecionado'}</span>
-              </div>
-            </div>
-
             <form onSubmit={adicionarAoCarrinho} className="bg-white border border-slate-200/90 rounded-2xl p-4 flex flex-wrap items-center gap-3 shadow-sm shrink-0">
               <div className="flex items-center gap-2.5">
                 <label className="text-xs font-bold text-slate-600 uppercase tracking-wide">Preço Unit. (R$):</label>
@@ -1850,27 +1844,126 @@ export default function App() {
             </form>
 
             <div className="bg-white border border-slate-200/90 rounded-2xl p-4 flex-1 flex flex-col overflow-hidden shadow-sm min-h-0">
-              <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-2.5 block">Itens da Venda Atual</span>
-              <ul className="flex-1 overflow-y-auto divide-y divide-slate-100 pr-1">
+              <div className="flex items-center justify-between mb-2.5">
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <span className="text-[11px] font-black uppercase tracking-widest text-slate-400">Itens da Venda Atual</span>
+                  {setorAtivo ? (
+                    <motion.div
+                      key={setorAtivo}
+                      initial={{ scale: 0.9, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      className={`flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-black shadow-2xs ${
+                        setorAtivo === 'RETIRADA'
+                          ? 'bg-rose-50 border border-rose-300 text-rose-700'
+                          : setorAtivo === 'MENSALISTA'
+                          ? 'bg-emerald-50 border border-emerald-800/30 text-emerald-900'
+                          : 'bg-sky-50 border border-sky-300 text-sky-700'
+                      }`}
+                    >
+                      <span className={`text-[9px] uppercase tracking-wider font-bold ${
+                        setorAtivo === 'RETIRADA'
+                          ? 'text-rose-500'
+                          : setorAtivo === 'MENSALISTA'
+                          ? 'text-emerald-700'
+                          : 'text-sky-500'
+                      }`}>
+                        Setor:
+                      </span>
+                      <span>{setorAtivo}</span>
+                    </motion.div>
+                  ) : (
+                    <span className="text-[10px] font-semibold text-slate-400 italic">
+                      (Nenhum setor selecionado)
+                    </span>
+                  )}
+                </div>
+
+                {carrinho.length > 0 && (
+                  <motion.span 
+                    key={carrinho.length}
+                    initial={{ scale: 1.25 }}
+                    animate={{ scale: 1 }}
+                    className="px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-[10px] font-black shadow-2xs"
+                  >
+                    {carrinho.length} {carrinho.length === 1 ? 'item' : 'itens'}
+                  </motion.span>
+                )}
+              </div>
+              <ul className="flex-1 overflow-y-auto overflow-x-hidden divide-y divide-slate-100 pr-1">
                 {carrinho.length === 0 ? (
                   <li className="h-full flex items-center justify-center text-sm text-slate-400 font-medium">Carrinho vazio. Selecione um setor e adicione itens (Pressione ENTER).</li>
                 ) : (
-                  carrinho.map((item, idx) => (
-                    <li key={idx} className="py-3 px-3 flex items-center justify-between hover:bg-slate-50 rounded-xl transition">
-                      <div className="flex items-center gap-3">
-                        <span className="font-black text-base text-slate-900 tracking-tight">{item.setor}</span>
-                        {item.obs && <span className="text-xs text-slate-500 italic font-medium">({item.obs})</span>}
-                      </div>
-                      <div className="flex items-center gap-5">
-                        <span className="font-black text-base text-emerald-600 tracking-tight">R$ {(item.valor * item.qtd).toFixed(2).replace('.', ',')}</span>
-                        <button onClick={() => setCarrinho(carrinho.filter((_, i) => i !== idx))} className="text-rose-500 hover:bg-rose-50 p-1.5 rounded-lg transition cursor-pointer">
-                          <X className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </li>
-                  ))
+                  <AnimatePresence initial={false}>
+                    {carrinho.map((item, idx) => (
+                      <motion.li 
+                        key={item.id || idx}
+                        initial={{ opacity: 0, y: -6, scale: 0.99, backgroundColor: 'rgba(16, 185, 129, 0.18)' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, backgroundColor: 'rgba(255, 255, 255, 0)' }}
+                        exit={{ opacity: 0, scale: 0.95, height: 0, padding: 0 }}
+                        transition={{ duration: 0.3, ease: "easeOut" }}
+                        className="py-3 px-3 flex items-center justify-between hover:bg-slate-50/80 rounded-xl transition border border-transparent hover:border-slate-100"
+                      >
+                        <div className="flex items-center gap-3">
+                          <span className="font-black text-base text-slate-900 tracking-tight">{item.setor}</span>
+                          {item.obs && <span className="text-xs text-slate-500 italic font-medium">({item.obs})</span>}
+                          {item.qtd > 1 && <span className="text-xs font-bold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600">x{item.qtd}</span>}
+                        </div>
+                        <div className="flex items-center gap-5">
+                          <span className="font-black text-base text-emerald-600 tracking-tight">R$ {(item.valor * item.qtd).toFixed(2).replace('.', ',')}</span>
+                          <button onClick={() => setCarrinho(carrinho.filter((_, i) => i !== idx))} className="text-rose-500 hover:bg-rose-50 p-1.5 rounded-lg transition cursor-pointer">
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </motion.li>
+                    ))}
+                  </AnimatePresence>
                 )}
               </ul>
+
+              {/* TOASTS UNIFICADOS NO RODAPÉ DO CARRINHO (DESLIZAM DA DIREITA PARA A ESQUERDA) */}
+              <div className="h-9 mt-2 w-full flex items-center justify-end gap-2 overflow-hidden pointer-events-none shrink-0">
+                <AnimatePresence>
+                  {toasts.map((t) => {
+                    const isVenda = t.mensagem.includes('VENDA REGISTRADA');
+                    const isRetirada = t.mensagem.includes('RETIRADA EFETUADA') || t.tipo === 'retirada';
+                    const isSucesso = t.tipo === 'sucesso' && !isVenda;
+                    const isErro = t.tipo === 'erro';
+                    const isAviso = t.tipo === 'aviso';
+
+                    const bgClass = isVenda
+                      ? 'bg-emerald-600 text-white border-emerald-500 shadow-emerald-600/30'
+                      : isRetirada || isErro
+                      ? 'bg-rose-600 text-white border-rose-500 shadow-rose-600/30'
+                      : isAviso
+                      ? 'bg-amber-600 text-white border-amber-500 shadow-amber-600/30'
+                      : 'bg-slate-900 text-white border-slate-700/80';
+
+                    const iconColor = (isVenda || isRetirada || isErro || isAviso)
+                      ? 'text-white'
+                      : isSucesso 
+                      ? 'text-emerald-400' 
+                      : 'text-sky-300';
+
+                    return (
+                      <motion.div
+                        key={t.id}
+                        layout
+                        initial={{ opacity: 0, x: 50, scale: 0.85 }}
+                        animate={{ opacity: 1, x: 0, scale: 1 }}
+                        exit={{ opacity: 0, x: -30, scale: 0.85, transition: { duration: 0.2 } }}
+                        transition={{ type: "spring", stiffness: 450, damping: 28 }}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl shadow-md border text-[11px] font-black tracking-wide shrink-0 whitespace-nowrap ${bgClass}`}
+                      >
+                        {(isSucesso || isVenda) && !isRetirada && <CheckCircle2 className={`w-3.5 h-3.5 ${iconColor} shrink-0`} />}
+                        {(isRetirada || isErro) && <AlertCircle className={`w-3.5 h-3.5 ${iconColor} shrink-0`} />}
+                        {isAviso && <AlertCircle className={`w-3.5 h-3.5 ${iconColor} shrink-0`} />}
+                        {t.tipo === 'neutro' && <CheckCircle2 className={`w-3.5 h-3.5 ${iconColor} shrink-0`} />}
+                        <span className="uppercase">{t.mensagem}</span>
+                      </motion.div>
+                    );
+                  })}
+                </AnimatePresence>
+              </div>
             </div>
 
             <div className="bg-white border border-slate-200/90 rounded-2xl p-4 shadow-sm shrink-0">
