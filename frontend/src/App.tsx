@@ -187,9 +187,18 @@ export default function App() {
         const ultimoLoginData = localStorage.getItem('yama_ultimo_login_data');
 
         if (ultimoLoginData && ultimoLoginData !== dataHoje) {
-          try { await supabase.auth.signOut(); } catch {}
           localStorage.removeItem('yama_ultimo_login_data');
           setLogado(false);
+          if (navigator.onLine) {
+            supabase.auth.signOut().catch(() => {});
+          }
+          return;
+        }
+
+        // Se já fez login hoje nesta máquina, libera o acesso IMEDIATAMENTE (sem travar esperando rede)
+        if (ultimoLoginData === dataHoje) {
+          setLogado(true);
+          await carregarStatus(unidade);
           return;
         }
 
@@ -201,7 +210,8 @@ export default function App() {
           console.warn("Verificação online de sessão falhou, checando cache local:", authErr);
         }
 
-        if (temSessao || (ultimoLoginData && ultimoLoginData === dataHoje)) {
+        if (temSessao) {
+          localStorage.setItem('yama_ultimo_login_data', dataHoje);
           setLogado(true);
           await carregarStatus(unidade);
         }
@@ -504,8 +514,9 @@ export default function App() {
 
     try {
       let autenticado = false;
+      let erroCredencialInvalida = false;
 
-      if (navigator.onLine) {
+      if (navigator.onLine && syncService.getState().isOnline) {
         try {
           const { error } = await supabase.auth.signInWithPassword({
             email: config.email,
@@ -514,16 +525,33 @@ export default function App() {
 
           if (!error) {
             autenticado = true;
+            syncService.reportarStatusRede(true);
             try {
               localStorage.setItem(`yama_offline_cred_${usuario}`, btoa(senha));
             } catch {}
           } else {
-            setErroLoginMsg('Senha incorreta ou erro de autenticação.');
-            return;
+            const msg = (error.message || '').toLowerCase();
+            const isInvalidCreds =
+              error.status === 400 ||
+              msg.includes('invalid login credentials') ||
+              msg.includes('invalid_credentials');
+
+            if (isInvalidCreds) {
+              erroCredencialInvalida = true;
+            } else {
+              console.warn("Falha de rede no login online, tentando cache offline:", error);
+              syncService.reportarStatusRede(false);
+            }
           }
         } catch (authErr) {
-          console.warn("Erro de rede no login online, testando cache offline:", authErr);
+          console.warn("Exceção de rede no login online, testando cache offline:", authErr);
+          syncService.reportarStatusRede(false);
         }
+      }
+
+      if (erroCredencialInvalida) {
+        setErroLoginMsg('Senha incorreta ou erro de autenticação.');
+        return;
       }
 
       if (!autenticado) {
@@ -561,181 +589,198 @@ export default function App() {
     dispararToast('Sessão encerrada.', 'aviso');
   };
 
+  const processarDadosCaixa = (sessao: any, vendasRaw: any[]) => {
+    if (!sessao) {
+      setStatusCaixa({
+        status: "Fechado",
+        dataHora: "CAIXA FECHADO",
+        trocoInicial: "0.00",
+        caixa2Ativo: false,
+        vendas: [],
+        totais: { totalVendas: 0.0, saldoCaixa: 0.0, repasseCaixa2: 0.0, totalClientesUnicos: 0, ticketMedio: 0.0, porSetor: {}, porPagamento: { DINHEIRO: 0, PIX: 0, DÉBITO: 0, CRÉDITO: 0 } }
+      });
+      setDadosVendasModal([]);
+      return;
+    }
+
+    let total_vendas = 0.0;
+    let dinheiro_liquido = 0.0;
+    let repasse_caixa_2 = 0.0;
+    const SETORES_ORDEM = [
+      "MATERIAIS", "CÓPIA", "IMPR. P/B", "IMPR. COLOR",
+      "PLASTIFICAÇÃO", "ENCADERNAÇÃO", "CARIMBO", "GRÁFICA",
+      "INFORMÁTICA", "PACOTE", "MENSALISTA", "RETIRADA"
+    ];
+    const por_setor: Record<string, number> = {};
+    SETORES_ORDEM.forEach(s => por_setor[s] = 0.0);
+
+    const por_pagto: Record<string, number> = { "DINHEIRO": 0.0, "PIX": 0.0, "DÉBITO": 0.0, "CRÉDITO": 0.0 };
+    const vendas_formatadas: any[] = [];
+    const ids_unicos_validos = new Set();
+
+    if (vendasRaw) {
+      vendasRaw.forEach((v: any) => {
+        const valor = parseFloat(v.valor);
+        const pagto = v.forma_pagto;
+        const setor = v.setor;
+
+        if (pagto !== "CANCELADO") {
+          ids_unicos_validos.add(v.numero_sequencial);
+          if (setor === "RETIRADA") {
+            por_setor["RETIRADA"] = (por_setor["RETIRADA"] || 0) + valor;
+            if (pagto === "DINHEIRO") dinheiro_liquido -= valor;
+          } else {
+            total_vendas += valor;
+            if (por_setor[setor] !== undefined) por_setor[setor] += valor;
+            if (por_pagto[pagto] !== undefined) por_pagto[pagto] += valor;
+            if (pagto === "DINHEIRO") {
+              dinheiro_liquido += valor;
+              if (v.is_caixa_2) repasse_caixa_2 += valor;
+            }
+          }
+        }
+
+        const dataCriacao = new Date(v.criado_em);
+        vendas_formatadas.push({
+          uuid: v.id,
+          id: String(v.numero_sequencial).padStart(4, '0'),
+          setor: setor,
+          hora: isNaN(dataCriacao.getTime()) ? '--:--:--' : dataCriacao.toLocaleTimeString(),
+          valor: valor,
+          valorFormatado: formatarMoedaPtBr(valor),
+          pagamento: pagto,
+          obs: v.observacao || "",
+          isCaixa2: v.is_caixa_2
+        });
+      });
+    }
+
+    vendas_formatadas.reverse();
+    const total_clientes = ids_unicos_validos.size;
+    const ticket_medio = total_clientes > 0 ? total_vendas / total_clientes : 0;
+    const dtAbertura = new Date(sessao.aberto_em).toLocaleString();
+
+    const statusObj = {
+      status: "Aberto",
+      sessaoId: sessao.id,
+      dataAberturaISO: sessao.aberto_em.slice(0, 10),
+      dataHora: dtAbertura,
+      trocoInicial: parseFloat(sessao.troco_inicial).toFixed(2),
+      caixa2Ativo: sessao.caixa_2_ativo,
+      vendas: vendas_formatadas,
+      totais: {
+        totalVendas: parseFloat(total_vendas.toFixed(2)),
+        saldoCaixa: parseFloat((parseFloat(sessao.troco_inicial) + dinheiro_liquido).toFixed(2)),
+        repasseCaixa2: parseFloat(repasse_caixa_2.toFixed(2)),
+        totalClientesUnicos: total_clientes,
+        ticketMedio: parseFloat(ticket_medio.toFixed(2)),
+        porSetor: por_setor,
+        porPagamento: por_pagto
+      }
+    };
+
+    setStatusCaixa(statusObj);
+    setDadosVendasModal(vendas_formatadas);
+  };
+
+  // Carregamento 100% instantâneo a partir do Dexie (0ms de espera de rede)
+  const carregarStatusLocal = async (uni = unidade) => {
+    try {
+      const sessoesLocais = await dbLocal.sessoes
+        .where("unidade")
+        .equals(uni)
+        .and(s => s.status === "ABERTO")
+        .reverse()
+        .sortBy("aberto_em");
+
+      const sessaoLocal = sessoesLocais && sessoesLocais.length > 0 ? sessoesLocais[0] : null;
+      if (!sessaoLocal) {
+        processarDadosCaixa(null, []);
+        return null;
+      }
+
+      const vendasLocais = await dbLocal.vendas
+        .where("sessao_id")
+        .equals(String(sessaoLocal.id))
+        .sortBy("numero_sequencial");
+
+      processarDadosCaixa(sessaoLocal, vendasLocais);
+      return sessaoLocal;
+    } catch (err) {
+      console.error("Erro ao carregar status local:", err);
+      return null;
+    }
+  };
+
   const carregarStatus = async (uni = unidade) => {
     try {
-      let sessao: any = null;
+      // 1. Renderiza IMEDIATAMENTE a partir do banco local (não trava a tela caso a internet tenha caído)
+      const sessaoLocal = await carregarStatusLocal(uni);
 
-      // 1. Tenta carregar sessão ativa online
-      if (navigator.onLine) {
-        try {
-          const { data: sessoes, error: errSessao } = await supabase
-            .from("caixa_sessoes")
-            .select("*")
-            .eq("unidade", uni)
-            .eq("status", "ABERTO")
-            .order("aberto_em", { ascending: false })
-            .limit(1);
-
-          if (!errSessao && sessoes && sessoes.length > 0) {
-            sessao = sessoes[0];
-            await syncService.cacheSessao(sessao);
-          }
-        } catch (errOnline) {
-          console.warn("Falha ao buscar sessão online, buscando no cache local:", errOnline);
-        }
-      }
-
-      // Se não encontrou online ou está offline, busca no Dexie local
-      if (!sessao) {
-        const sessaoLocal = await dbLocal.sessoes
-          .where("unidade")
-          .equals(uni)
-          .and(s => s.status === "ABERTO")
-          .reverse()
-          .sortBy("aberto_em");
-
-        if (sessaoLocal && sessaoLocal.length > 0) {
-          sessao = sessaoLocal[0];
-        }
-      }
-
-      if (!sessao) {
-        setStatusCaixa({
-          status: "Fechado",
-          dataHora: "CAIXA FECHADO",
-          trocoInicial: "0.00",
-          caixa2Ativo: false,
-          vendas: [],
-          totais: { totalVendas: 0.0, saldoCaixa: 0.0, repasseCaixa2: 0.0, totalClientesUnicos: 0, ticketMedio: 0.0, porSetor: {}, porPagamento: { DINHEIRO: 0, PIX: 0, DÉBITO: 0, CRÉDITO: 0 } }
-        });
-        setDadosVendasModal([]);
+      // 2. Se estiver offline, encerra aqui mantendo o estado local instantâneo
+      if (!navigator.onLine || !syncService.getState().isOnline) {
         return;
       }
 
-      // 2. Carrega vendas: combina online e locais
-      let vendasRaw: any[] = [];
-      const sessaoIdStr = String(sessao.id);
+      // 3. Tenta sincronizar/buscar dados da nuvem em segundo plano (com timeout curto de 4s)
+      try {
+        const { data: sessoes, error: errSessao } = await supabase
+          .from("caixa_sessoes")
+          .select("*")
+          .eq("unidade", uni)
+          .eq("status", "ABERTO")
+          .order("aberto_em", { ascending: false })
+          .limit(1);
 
-      if (navigator.onLine) {
-        try {
-          const { data, error: errVendas } = await supabase
-            .from("vendas")
-            .select("*")
-            .eq("sessao_id", sessao.id)
-            .order("numero_sequencial", { ascending: true });
-
-          if (!errVendas && data) {
-            vendasRaw = data;
-            await syncService.cacheVendas(data, sessaoIdStr);
-          }
-        } catch (errVendasOnline) {
-          console.warn("Falha ao buscar vendas online, buscando no cache local:", errVendasOnline);
+        if (errSessao) {
+          syncService.reportarStatusRede(false);
+          return;
         }
-      }
 
-      // Busca vendas locais desta sessão (inclui pendentes e as que já foram cacheadas)
-      const vendasLocais = await dbLocal.vendas
-        .where("sessao_id")
-        .equals(sessaoIdStr)
-        .sortBy("numero_sequencial");
+        syncService.reportarStatusRede(true);
 
-      // Faz merge para garantir que nenhuma venda recente/offline seja perdida
-      if (vendasRaw.length === 0) {
-        vendasRaw = vendasLocais;
-      } else {
-        const idsVendasRaw = new Set(vendasRaw.map(v => String(v.id)));
-        vendasLocais.forEach(vl => {
-          if (!idsVendasRaw.has(String(vl.id))) {
-            vendasRaw.push(vl);
-          } else if (vl.sync_action === 'cancel' || vl.forma_pagto === 'CANCELADO') {
-            const idx = vendasRaw.findIndex(v => String(v.id) === String(vl.id));
-            if (idx >= 0) {
-              vendasRaw[idx].forma_pagto = 'CANCELADO';
-              vendasRaw[idx].observacao = vl.observacao;
-            }
-          }
-        });
-        vendasRaw.sort((a, b) => Number(a.numero_sequencial) - Number(b.numero_sequencial));
-      }
-
-      let total_vendas = 0.0;
-      let dinheiro_liquido = 0.0;
-      let repasse_caixa_2 = 0.0;
-      const SETORES_ORDEM = [
-        "MATERIAIS", "CÓPIA", "IMPR. P/B", "IMPR. COLOR",
-        "PLASTIFICAÇÃO", "ENCADERNAÇÃO", "CARIMBO", "GRÁFICA",
-        "INFORMÁTICA", "PACOTE", "MENSALISTA", "RETIRADA"
-      ];
-      const por_setor: Record<string, number> = {};
-      SETORES_ORDEM.forEach(s => por_setor[s] = 0.0);
-
-      const por_pagto: Record<string, number> = { "DINHEIRO": 0.0, "PIX": 0.0, "DÉBITO": 0.0, "CRÉDITO": 0.0 };
-      const vendas_formatadas: any[] = [];
-      const ids_unicos_validos = new Set();
-
-      if (vendasRaw) {
-        vendasRaw.forEach((v: any) => {
-          const valor = parseFloat(v.valor);
-          const pagto = v.forma_pagto;
-          const setor = v.setor;
-
-          if (pagto !== "CANCELADO") {
-            ids_unicos_validos.add(v.numero_sequencial);
-            if (setor === "RETIRADA") {
-              por_setor["RETIRADA"] = (por_setor["RETIRADA"] || 0) + valor;
-              if (pagto === "DINHEIRO") dinheiro_liquido -= valor;
-            } else {
-              total_vendas += valor;
-              if (por_setor[setor] !== undefined) por_setor[setor] += valor;
-              if (por_pagto[pagto] !== undefined) por_pagto[pagto] += valor;
-              if (pagto === "DINHEIRO") {
-                dinheiro_liquido += valor;
-                if (v.is_caixa_2) repasse_caixa_2 += valor;
-              }
-            }
-          }
-
-          const dataCriacao = new Date(v.criado_em);
-          vendas_formatadas.push({
-            uuid: v.id,
-            id: String(v.numero_sequencial).padStart(4, '0'),
-            setor: setor,
-            hora: isNaN(dataCriacao.getTime()) ? '--:--:--' : dataCriacao.toLocaleTimeString(),
-            valor: valor,
-            valorFormatado: formatarMoedaPtBr(valor),
-            pagamento: pagto,
-            obs: v.observacao || "",
-            isCaixa2: v.is_caixa_2
-          });
-        });
-      }
-
-      vendas_formatadas.reverse();
-      const total_clientes = ids_unicos_validos.size;
-      const ticket_medio = total_clientes > 0 ? total_vendas / total_clientes : 0;
-      const dtAbertura = new Date(sessao.aberto_em).toLocaleString();
-
-      const statusObj = {
-        status: "Aberto",
-        sessaoId: sessao.id,
-        dataAberturaISO: sessao.aberto_em.slice(0, 10),
-        dataHora: dtAbertura,
-        trocoInicial: parseFloat(sessao.troco_inicial).toFixed(2),
-        caixa2Ativo: sessao.caixa_2_ativo,
-        vendas: vendas_formatadas,
-        totais: {
-          totalVendas: parseFloat(total_vendas.toFixed(2)),
-          saldoCaixa: parseFloat((parseFloat(sessao.troco_inicial) + dinheiro_liquido).toFixed(2)),
-          repasseCaixa2: parseFloat(repasse_caixa_2.toFixed(2)),
-          totalClientesUnicos: total_clientes,
-          ticketMedio: parseFloat(ticket_medio.toFixed(2)),
-          porSetor: por_setor,
-          porPagamento: por_pagto
+        if (sessoes && sessoes.length > 0) {
+          await syncService.cacheSessao(sessoes[0]);
+        } else if (sessaoLocal && sessaoLocal.sync_status === 'synced') {
+          // Sessão antiga já sincronizada que foi fechada remotamente
+          await dbLocal.sessoes.update(String(sessaoLocal.id), { status: 'FECHADO' });
         }
-      };
+      } catch (errOnline) {
+        console.warn("Falha ao buscar sessão online, mantendo cache local:", errOnline);
+        syncService.reportarStatusRede(false);
+        return;
+      }
 
-      setStatusCaixa(statusObj);
-      setDadosVendasModal(vendas_formatadas);
+      const sessoesAtuais = await dbLocal.sessoes
+        .where("unidade")
+        .equals(uni)
+        .and(s => s.status === "ABERTO")
+        .reverse()
+        .sortBy("aberto_em");
+
+      const sessaoAtiva = sessoesAtuais && sessoesAtuais.length > 0 ? sessoesAtuais[0] : null;
+      if (!sessaoAtiva) {
+        processarDadosCaixa(null, []);
+        return;
+      }
+
+      const sessaoIdStr = String(sessaoAtiva.id);
+
+      try {
+        const { data: vendasNuvem, error: errVendas } = await supabase
+          .from("vendas")
+          .select("*")
+          .eq("sessao_id", sessaoAtiva.id)
+          .order("numero_sequencial", { ascending: true });
+
+        if (!errVendas && vendasNuvem) {
+          await syncService.cacheVendas(vendasNuvem, sessaoIdStr);
+        }
+      } catch (errVendasOnline) {
+        console.warn("Falha ao buscar vendas online, mantendo cache local:", errVendasOnline);
+      }
+
+      await carregarStatusLocal(uni);
     } catch (err) {
       console.error("Erro ao carregar status do caixa:", err);
     }
@@ -762,49 +807,50 @@ export default function App() {
       const novoId = crypto.randomUUID();
       const agora = new Date().toISOString();
 
-      let gravadoOnline = false;
-
-      if (navigator.onLine) {
-        try {
-          const { data, error } = await supabase
-            .from("caixa_sessoes")
-            .insert([{ unidade, status: "ABERTO", troco_inicial: valorTroco, caixa_2_ativo: false }])
-            .select()
-            .single();
-
-          if (!error && data) {
-            gravadoOnline = true;
-            await dbLocal.sessoes.put({
-              id: String(data.id),
-              unidade: data.unidade,
-              status: data.status,
-              troco_inicial: Number(data.troco_inicial) || 0,
-              caixa_2_ativo: !!data.caixa_2_ativo,
-              aberto_em: data.aberto_em,
-              sync_status: 'synced'
-            });
-          }
-        } catch (e) {
-          console.warn("Erro ao abrir caixa no Supabase, abrindo offline:", e);
-        }
-      }
-
-      if (!gravadoOnline) {
-        await dbLocal.sessoes.put({
-          id: novoId,
-          unidade: unidade,
-          status: "ABERTO",
-          troco_inicial: valorTroco,
-          caixa_2_ativo: false,
-          aberto_em: agora,
-          sync_status: 'pending'
-        });
-      }
+      // 1. Grava IMEDIATAMENTE no banco local Dexie como pendente
+      await dbLocal.sessoes.put({
+        id: novoId,
+        unidade: unidade,
+        status: "ABERTO",
+        troco_inicial: valorTroco,
+        caixa_2_ativo: false,
+        aberto_em: agora,
+        sync_status: 'pending'
+      });
 
       await syncService.contarPendentes();
-      await carregarStatus(unidade);
+      await carregarStatusLocal(unidade);
       setModalAberto(null);
-      dispararToast(gravadoOnline ? 'Caixa aberto com sucesso!' : 'Caixa aberto em modo offline!', 'sucesso');
+      dispararToast('Caixa aberto com sucesso!', 'sucesso');
+
+      // 2. Tenta sincronizar com o Supabase em segundo plano sem travar o operador
+      void (async () => {
+        if (navigator.onLine && syncService.getState().isOnline) {
+          try {
+            const { error } = await supabase
+              .from("caixa_sessoes")
+              .insert([{
+                id: novoId,
+                unidade,
+                status: "ABERTO",
+                troco_inicial: valorTroco,
+                caixa_2_ativo: false,
+                aberto_em: agora
+              }]);
+
+            if (!error) {
+              await dbLocal.sessoes.update(novoId, { sync_status: 'synced' });
+              syncService.reportarStatusRede(true);
+              await syncService.contarPendentes();
+            } else {
+              syncService.reportarStatusRede(false);
+            }
+          } catch (e) {
+            console.warn("Abertura de caixa mantida na fila offline:", e);
+            syncService.reportarStatusRede(false);
+          }
+        }
+      })();
     } catch (err) {
       alert('Erro ao abrir caixa.');
     } finally {
@@ -953,21 +999,6 @@ export default function App() {
       const nomeResumo = `${dataCaixaFormatada}.pdf`;
       const caminhoResumo = `${unidadeLower}/resumo/${nomeResumo}`;
 
-      // Uploads dos relatórios (tenta online; se offline, enfileira localmente)
-      let uploadResumoOk = false;
-      let uploadVendasOk = false;
-
-      if (navigator.onLine) {
-        try {
-          const { error: err1 } = await supabase.storage
-            .from('relatorios')
-            .upload(caminhoResumo, blobResumo, { contentType: 'application/pdf', upsert: true });
-          if (!err1) uploadResumoOk = true;
-        } catch (e) {
-          console.warn("Upload resumo online falhou:", e);
-        }
-      }
-
       // ==========================================
       // 2. GERAR E GUARDAR PDF DE VENDAS DETALHADAS (dd_mm_aa-V.pdf)
       // ==========================================
@@ -1018,60 +1049,30 @@ export default function App() {
       const nomeVendas = `${dataCaixaFormatada}-V.pdf`;
       const caminhoVendas = `${unidadeLower}/vendas/${nomeVendas}`;
 
-      if (navigator.onLine) {
-        try {
-          const { error: err2 } = await supabase.storage
-            .from('relatorios')
-            .upload(caminhoVendas, blobVendas, { contentType: 'application/pdf', upsert: true });
-          if (!err2) uploadVendasOk = true;
-        } catch (e) {
-          console.warn("Upload vendas online falhou:", e);
-        }
-      }
-
-      if (!uploadResumoOk) {
-        await dbLocal.storageQueue.add({
-          bucket: 'relatorios',
-          caminho: caminhoResumo,
-          blob: blobResumo,
-          contentType: 'application/pdf',
-          criado_em: new Date().toISOString()
-        });
-      }
-
-      if (!uploadVendasOk) {
-        await dbLocal.storageQueue.add({
-          bucket: 'relatorios',
-          caminho: caminhoVendas,
-          blob: blobVendas,
-          contentType: 'application/pdf',
-          criado_em: new Date().toISOString()
-        });
-      }
-
-      // ==========================================
-      // 3. ATUALIZAR STATUS NO BANCO PARA FECHADO
-      // ==========================================
+      // 3. SALVA IMEDIATAMENTE NA FILA LOCAL E FECHA A SESSÃO LOCALMENTE (OFFLINE-FIRST)
       const agoraFechadoIso = new Date().toISOString();
-      let sessaoFechadaOnline = false;
+      const sessaoIdParaFechar = String(statusCaixa.sessaoId);
 
-      if (navigator.onLine) {
-        try {
-          const { error } = await supabase
-            .from("caixa_sessoes")
-            .update({ status: "FECHADO", fechado_em: agoraFechadoIso })
-            .eq("id", statusCaixa.sessaoId);
+      await dbLocal.storageQueue.add({
+        bucket: 'relatorios',
+        caminho: caminhoResumo,
+        blob: blobResumo,
+        contentType: 'application/pdf',
+        criado_em: agoraFechadoIso
+      });
 
-          if (!error) sessaoFechadaOnline = true;
-        } catch (errSessao) {
-          console.warn("Fechamento online de sessão falhou:", errSessao);
-        }
-      }
+      await dbLocal.storageQueue.add({
+        bucket: 'relatorios',
+        caminho: caminhoVendas,
+        blob: blobVendas,
+        contentType: 'application/pdf',
+        criado_em: agoraFechadoIso
+      });
 
-      await dbLocal.sessoes.update(String(statusCaixa.sessaoId), {
+      await dbLocal.sessoes.update(sessaoIdParaFechar, {
         status: "FECHADO",
         fechado_em: agoraFechadoIso,
-        sync_status: sessaoFechadaOnline ? 'synced' : 'pending'
+        sync_status: 'pending'
       });
 
       const urlResumo = URL.createObjectURL(blobResumo);
@@ -1083,8 +1084,11 @@ export default function App() {
       setMensagemSucesso(`O relatório de resumo foi gerado como ${nomeResumo}.`);
       setModalAberto('sucesso_fechamento');
       await syncService.contarPendentes();
-      await carregarStatus();
+      await carregarStatusLocal(unidade);
       dispararToast('Caixa fechado e relatório guardado!', 'sucesso');
+
+      // 4. Dispara sincronização em segundo plano (se houver internet, envia imediatamente os PDFs e o fechamento)
+      void syncService.sincronizar();
     } catch (err: any) {
       console.error("Erro ao fechar caixa:", err);
       alert('Erro ao fechar caixa: ' + (err.message || 'Erro desconhecido'));
@@ -1101,34 +1105,13 @@ export default function App() {
 
       const isIniciar = acao === 'iniciar';
       const repasse = statusCaixa.totais?.repasseCaixa2 || 0;
+      const sessaoIdStr = String(statusCaixa.sessaoId);
 
-      let onlineOk = false;
-      if (navigator.onLine) {
-        try {
-          if (isIniciar) {
-            const { error } = await supabase
-              .from("caixa_sessoes")
-              .update({ caixa_2_ativo: true })
-              .eq("id", statusCaixa.sessaoId);
-
-            if (!error) onlineOk = true;
-          } else {
-            const { error } = await supabase
-              .from("caixa_sessoes")
-              .update({ caixa_2_ativo: false, repasse_caixa_2: repasse })
-              .eq("id", statusCaixa.sessaoId);
-
-            if (!error) onlineOk = true;
-          }
-        } catch (errTroca) {
-          console.warn("Troca de caixa online falhou:", errTroca);
-        }
-      }
-
-      await dbLocal.sessoes.update(String(statusCaixa.sessaoId), {
+      // 1. Atualiza IMEDIATAMENTE no banco local Dexie
+      await dbLocal.sessoes.update(sessaoIdStr, {
         caixa_2_ativo: isIniciar,
         ...(isIniciar ? {} : { repasse_caixa_2: repasse }),
-        sync_status: onlineOk ? 'synced' : 'pending'
+        sync_status: 'pending'
       });
 
       if (isIniciar) {
@@ -1139,7 +1122,34 @@ export default function App() {
 
       setModalAberto('sucesso_troca');
       await syncService.contarPendentes();
-      await carregarStatus();
+      await carregarStatusLocal(unidade);
+
+      // 2. Tenta sincronizar com o Supabase em segundo plano
+      void (async () => {
+        if (navigator.onLine && syncService.getState().isOnline) {
+          try {
+            const payloadUpdate = isIniciar
+              ? { caixa_2_ativo: true }
+              : { caixa_2_ativo: false, repasse_caixa_2: repasse };
+
+            const { error } = await supabase
+              .from("caixa_sessoes")
+              .update(payloadUpdate)
+              .eq("id", sessaoIdStr);
+
+            if (!error) {
+              await dbLocal.sessoes.update(sessaoIdStr, { sync_status: 'synced' });
+              syncService.reportarStatusRede(true);
+              await syncService.contarPendentes();
+            } else {
+              syncService.reportarStatusRede(false);
+            }
+          } catch (errTroca) {
+            console.warn("Troca de caixa mantida na fila offline:", errTroca);
+            syncService.reportarStatusRede(false);
+          }
+        }
+      })();
     } catch (err) {
       alert('Erro na troca de caixa.');
       setModalAberto(null);
@@ -1247,29 +1257,14 @@ export default function App() {
     try {
       const sessaoIdStr = String(statusCaixa.sessaoId);
 
-      // Determina próximo sequencial combinando histórico local e online
+      // 1. Determina próximo sequencial IMEDIATAMENTE a partir do banco local + memória (sem bloquear na rede)
       const vendasLocais = await dbLocal.vendas.where("sessao_id").equals(sessaoIdStr).toArray();
-      let maxSeq = vendasLocais.reduce((max, v) => Math.max(max, Number(v.numero_sequencial) || 0), 0);
+      const maxLocal = vendasLocais.reduce((max, v) => Math.max(max, Number(v.numero_sequencial) || 0), 0);
+      const maxMemoria = (statusCaixa.vendas || []).reduce((max: number, v: any) => Math.max(max, Number(v.id) || 0), 0);
+      const proximoSeq = Math.max(maxLocal, maxMemoria) + 1;
 
-      if (navigator.onLine) {
-        try {
-          const { data: ultimas } = await supabase
-            .from("vendas")
-            .select("numero_sequencial")
-            .eq("sessao_id", statusCaixa.sessaoId)
-            .order("numero_sequencial", { ascending: false })
-            .limit(1);
-
-          if (ultimas && ultimas.length > 0) {
-            maxSeq = Math.max(maxSeq, Number(ultimas[0].numero_sequencial) || 0);
-          }
-        } catch (e) {
-          console.warn("Consulta online de sequencial falhou, usando base local:", e);
-        }
-      }
-
-      const proximoSeq = maxSeq + 1;
-      const isC2 = statusCaixa.caixa2Ativo;
+      const isC2 = !!statusCaixa.caixa2Ativo;
+      const agoraIso = new Date().toISOString();
 
       const novosRegistros: LocalVenda[] = itensParaEnviar.map(item => ({
         id: crypto.randomUUID(),
@@ -1282,44 +1277,55 @@ export default function App() {
         forma_pagto: formaPagto,
         observacao: isC2 ? `[2º CAIXA] ${item.obs || ''}`.trim() : (item.obs || ''),
         is_caixa_2: isC2,
-        criado_em: new Date().toISOString(),
+        criado_em: agoraIso,
         sync_status: 'pending',
         sync_action: 'insert'
       }));
 
-      // 1. Salva imediatamente no banco local Dexie
+      // 2. Salva IMEDIATAMENTE no banco local Dexie (0ms de risco de perda)
       await dbLocal.vendas.bulkPut(novosRegistros);
 
-      // 2. Se houver conexão, tenta enviar ao Supabase imediatamente
-      if (navigator.onLine) {
-        try {
-          const linhasInserir = novosRegistros.map(r => ({
-            id: r.id,
-            sessao_id: r.sessao_id,
-            unidade: r.unidade,
-            numero_sequencial: r.numero_sequencial,
-            setor: r.setor,
-            valor: r.valor,
-            quantidade: r.quantidade,
-            forma_pagto: r.forma_pagto,
-            observacao: r.observacao,
-            is_caixa_2: r.is_caixa_2,
-            criado_em: r.criado_em
-          }));
-
-          const { error } = await supabase.from("vendas").insert(linhasInserir);
-          if (!error) {
-            for (const r of novosRegistros) {
-              await dbLocal.vendas.update(r.id, { sync_status: 'synced', sync_action: undefined });
-            }
-          }
-        } catch (syncErr) {
-          console.warn("Envio imediato ao Supabase falhou, mantendo na fila local:", syncErr);
-        }
-      }
-
+      // 3. Atualiza IMEDIATAMENTE a interface, rodapé e totais locais
       await syncService.contarPendentes();
-      await carregarStatus();
+      await carregarStatusLocal(unidade);
+
+      // 4. Envia para o Supabase em segundo plano sem travar o operador
+      void (async () => {
+        if (navigator.onLine && syncService.getState().isOnline) {
+          try {
+            const linhasInserir = novosRegistros.map(r => ({
+              id: r.id,
+              sessao_id: r.sessao_id,
+              unidade: r.unidade,
+              numero_sequencial: r.numero_sequencial,
+              setor: r.setor,
+              valor: r.valor,
+              quantidade: r.quantidade,
+              forma_pagto: r.forma_pagto,
+              observacao: r.observacao,
+              is_caixa_2: r.is_caixa_2,
+              criado_em: r.criado_em
+            }));
+
+            const { error } = await supabase.from("vendas").insert(linhasInserir);
+            if (!error) {
+              for (const r of novosRegistros) {
+                await dbLocal.vendas.update(r.id, { sync_status: 'synced', sync_action: undefined });
+              }
+              syncService.reportarStatusRede(true);
+              await syncService.contarPendentes();
+            } else {
+              console.warn("Falha ao enviar venda online, mantida na fila local:", error);
+              syncService.reportarStatusRede(false);
+              await syncService.contarPendentes();
+            }
+          } catch (syncErr) {
+            console.warn("Envio imediato ao Supabase falhou, mantendo na fila local:", syncErr);
+            syncService.reportarStatusRede(false);
+            await syncService.contarPendentes();
+          }
+        }
+      })();
     } catch (err) {
       console.error('Erro ao registrar venda:', err);
       alert('Erro ao registrar venda.');
@@ -1333,10 +1339,10 @@ export default function App() {
     }
     setCarregando(true);
     try {
-      const vendaId = vendaParaCancelar.uuid;
+      const vendaId = String(vendaParaCancelar.uuid);
       const motivo = motivoCancelamento.trim();
 
-      // Atualiza localmente
+      // 1. Atualiza IMEDIATAMENTE no banco local Dexie
       await dbLocal.vendas.update(vendaId, {
         forma_pagto: "CANCELADO",
         observacao: motivo,
@@ -1344,29 +1350,37 @@ export default function App() {
         sync_action: 'cancel'
       });
 
-      // Tenta atualizar no Supabase se online
-      if (navigator.onLine) {
-        try {
-          const { error } = await supabase
-            .from("vendas")
-            .update({ forma_pagto: "CANCELADO", observacao: motivo })
-            .eq("id", vendaId);
-
-          if (!error) {
-            await dbLocal.vendas.update(vendaId, { sync_status: 'synced', sync_action: undefined });
-          }
-        } catch (e) {
-          console.warn("Cancelamento mantido na fila local:", e);
-        }
-      }
-
       setVendaParaCancelar(null);
       setMotivoCancelamento('');
       setSucessoExclusaoMsg('Venda excluída com sucesso.');
       dispararToast('VENDA EXCLUÍDA / CANCELADA', 'retirada');
       
       await syncService.contarPendentes();
-      await carregarStatus();
+      await carregarStatusLocal(unidade);
+
+      // 2. Tenta atualizar no Supabase em segundo plano
+      void (async () => {
+        if (navigator.onLine && syncService.getState().isOnline) {
+          try {
+            const { data: atualizadas, error } = await supabase
+              .from("vendas")
+              .update({ forma_pagto: "CANCELADO", observacao: motivo })
+              .eq("id", vendaId)
+              .select('id');
+
+            if (!error && atualizadas && atualizadas.length > 0) {
+              await dbLocal.vendas.update(vendaId, { sync_status: 'synced', sync_action: undefined });
+              syncService.reportarStatusRede(true);
+              await syncService.contarPendentes();
+            } else if (error) {
+              syncService.reportarStatusRede(false);
+            }
+          } catch (e) {
+            console.warn("Cancelamento mantido na fila local:", e);
+            syncService.reportarStatusRede(false);
+          }
+        }
+      })();
     } catch (err) {
       alert('Erro ao excluir venda.');
     } finally {

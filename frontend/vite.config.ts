@@ -7,7 +7,11 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.ico', 'icon-192.png', 'icon-512.png'],
+      includeAssets: ['favicon.svg', 'icons.svg', 'logo-orc.png', 'icon-192.png', 'icon-512.png', 'icon/logo.svg', 'bg/bg.png'],
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,ttf,woff,woff2}'],
+        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024
+      },
       manifest: {
         name: 'PDV - Yama Print',
         short_name: 'YAMA PRINT',

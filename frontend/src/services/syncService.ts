@@ -1,5 +1,5 @@
-import { supabase } from '../supabaseClient';
-import { dbLocal, type LocalVenda, type LocalSessao } from '../db/localDb';
+import { supabase, SUPABASE_URL, SUPABASE_KEY } from '../supabaseClient';
+import { dbLocal, type LocalVenda } from '../db/localDb';
 
 export type SyncStatusType = 'online' | 'offline' | 'syncing';
 
@@ -25,16 +25,16 @@ class SyncService {
     if (typeof window !== 'undefined') {
       window.addEventListener('online', () => this.handleNetworkChange(true));
       window.addEventListener('offline', () => this.handleNetworkChange(false));
-      
-      // Checagem periódica a cada 20 segundos
+
+      // Checagem periódica real a cada 15 segundos
       this.intervalId = setInterval(() => {
         this.verificarEAtualizar();
-      }, 20000);
+      }, 15000);
 
-      // Verificação inicial
+      // Verificação inicial rápida
       setTimeout(() => {
         this.verificarEAtualizar();
-      }, 1000);
+      }, 500);
     }
   }
 
@@ -63,6 +63,13 @@ class SyncService {
     };
   }
 
+  public reportarStatusRede(online: boolean) {
+    if (this.isOnline !== online) {
+      this.isOnline = online;
+      this.notify();
+    }
+  }
+
   private notify() {
     const state = this.getState();
     this.listeners.forEach((cb) => {
@@ -75,9 +82,13 @@ class SyncService {
   }
 
   private async handleNetworkChange(online: boolean) {
-    this.isOnline = online;
-    this.notify();
-    if (online) {
+    if (!online) {
+      this.isOnline = false;
+      this.notify();
+      return;
+    }
+    const conectado = await this.testarConexao();
+    if (conectado) {
       await this.sincronizar();
     }
   }
@@ -88,6 +99,7 @@ class SyncService {
       const pendentesSessoes = await dbLocal.sessoes.where('sync_status').equals('pending').count();
       const pendentesUploads = await dbLocal.storageQueue.count();
       this.pendingCount = pendentesVendas + pendentesSessoes + pendentesUploads;
+      this.notify();
       return this.pendingCount;
     } catch {
       return 0;
@@ -97,34 +109,43 @@ class SyncService {
   public async testarConexao(): Promise<boolean> {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       this.isOnline = false;
+      this.notify();
       return false;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+
     try {
-      // Teste leve com timeout de 3 segundos para garantir que a rede responde
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
+      // Ping HTTP direto ao endpoint REST do Supabase com no-store e timeout de 3s.
+      // Detecta quedas reais da operadora mesmo quando o roteador local continua ligado.
+      const response = await fetch(`${SUPABASE_URL}/rest/v1/caixa_sessoes?select=id&limit=1`, {
+        method: 'HEAD',
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+        },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
 
-      // Faz um teste rápido de ping para o Supabase
-      const { error } = await supabase.from('caixa_sessoes').select('id').limit(1).abortSignal(controller.signal);
-      clearTimeout(timeoutId);
-
-      this.isOnline = !error || error.code !== 'PGRST301';
+      this.isOnline = response.status >= 200 && response.status < 500;
+      this.notify();
       return this.isOnline;
     } catch {
       this.isOnline = false;
+      this.notify();
       return false;
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
   public async verificarEAtualizar() {
     await this.contarPendentes();
-    if (typeof navigator !== 'undefined') {
-      this.isOnline = navigator.onLine;
-    }
-    this.notify();
+    const onlineAgora = await this.testarConexao();
 
-    if (this.isOnline && this.pendingCount > 0 && !this.isSyncing) {
+    if (onlineAgora && this.pendingCount > 0 && !this.isSyncing) {
       await this.sincronizar();
     }
   }
@@ -136,7 +157,6 @@ class SyncService {
 
     const conectado = await this.testarConexao();
     if (!conectado) {
-      this.notify();
       return { sucesso: false, sincronizados: 0, erro: 'Sem conexão com a internet.' };
     }
 
@@ -161,10 +181,38 @@ class SyncService {
             ...(sessao.repasse_caixa_2 !== undefined ? { repasse_caixa_2: sessao.repasse_caixa_2 } : {})
           };
 
-          const { error } = await supabase.from('caixa_sessoes').upsert(payload);
-          if (!error) {
-            await dbLocal.sessoes.update(sessao.id, { sync_status: 'synced' });
-            totalSincronizados++;
+          const { data: jaExiste, error: errBusca } = await supabase
+            .from('caixa_sessoes')
+            .select('id')
+            .eq('id', sessao.id);
+
+          if (!errBusca) {
+            let errOperacao: any = null;
+            if (jaExiste && jaExiste.length > 0) {
+              const { error } = await supabase
+                .from('caixa_sessoes')
+                .update({
+                  status: sessao.status,
+                  troco_inicial: sessao.troco_inicial,
+                  caixa_2_ativo: sessao.caixa_2_ativo,
+                  ...(sessao.fechado_em ? { fechado_em: sessao.fechado_em } : {}),
+                  ...(sessao.repasse_caixa_2 !== undefined ? { repasse_caixa_2: sessao.repasse_caixa_2 } : {})
+                })
+                .eq('id', sessao.id);
+              errOperacao = error;
+            } else {
+              const { error } = await supabase.from('caixa_sessoes').insert([payload]);
+              if (error && error.code === '23505') {
+                errOperacao = null;
+              } else {
+                errOperacao = error;
+              }
+            }
+
+            if (!errOperacao) {
+              await dbLocal.sessoes.update(sessao.id, { sync_status: 'synced' });
+              totalSincronizados++;
+            }
           }
         } catch (e) {
           console.error('Erro ao sincronizar sessão:', sessao.id, e);
@@ -175,34 +223,44 @@ class SyncService {
       const vendasPendentes = await dbLocal.vendas.where('sync_status').equals('pending').toArray();
       for (const venda of vendasPendentes) {
         try {
+          const payload = {
+            id: venda.id,
+            sessao_id: venda.sessao_id,
+            unidade: venda.unidade,
+            numero_sequencial: venda.numero_sequencial,
+            setor: venda.setor,
+            valor: venda.valor,
+            quantidade: venda.quantidade,
+            forma_pagto: venda.forma_pagto,
+            observacao: venda.observacao,
+            is_caixa_2: venda.is_caixa_2,
+            criado_em: venda.criado_em
+          };
+
           if (venda.sync_action === 'cancel') {
-            const { error } = await supabase
+            const { data: atualizadas, error } = await supabase
               .from('vendas')
               .update({ forma_pagto: 'CANCELADO', observacao: venda.observacao })
-              .eq('id', venda.id);
+              .eq('id', venda.id)
+              .select('id');
 
             if (!error) {
-              await dbLocal.vendas.update(venda.id, { sync_status: 'synced', sync_action: undefined });
-              totalSincronizados++;
+              // Se a venda foi criada e cancelada enquanto estava offline (ainda não existia no Supabase), insere já como CANCELADO
+              if (!atualizadas || atualizadas.length === 0) {
+                const { error: errInsertCancel } = await supabase.from('vendas').insert([payload]);
+                if (!errInsertCancel || errInsertCancel.code === '23505') {
+                  await dbLocal.vendas.update(venda.id, { sync_status: 'synced', sync_action: undefined });
+                  totalSincronizados++;
+                }
+              } else {
+                await dbLocal.vendas.update(venda.id, { sync_status: 'synced', sync_action: undefined });
+                totalSincronizados++;
+              }
             }
           } else {
             // Inserção normal
-            const payload = {
-              id: venda.id,
-              sessao_id: venda.sessao_id,
-              unidade: venda.unidade,
-              numero_sequencial: venda.numero_sequencial,
-              setor: venda.setor,
-              valor: venda.valor,
-              quantidade: venda.quantidade,
-              forma_pagto: venda.forma_pagto,
-              observacao: venda.observacao,
-              is_caixa_2: venda.is_caixa_2,
-              criado_em: venda.criado_em
-            };
-
-            const { error } = await supabase.from('vendas').upsert(payload);
-            if (!error) {
+            const { error } = await supabase.from('vendas').insert([payload]);
+            if (!error || error.code === '23505') {
               await dbLocal.vendas.update(venda.id, { sync_status: 'synced', sync_action: undefined });
               totalSincronizados++;
             }
@@ -244,12 +302,18 @@ class SyncService {
     }
   }
 
-  // Helpers para salvar dados no cache local quando lidos da nuvem
+  // Helpers para salvar dados no cache local quando lidos da nuvem, protegendo registros 'pending'
   public async cacheSessao(sessao: any) {
     if (!sessao || !sessao.id) return;
     try {
+      const idStr = String(sessao.id);
+      const localExistente = await dbLocal.sessoes.get(idStr);
+      if (localExistente && localExistente.sync_status === 'pending') {
+        return;
+      }
+
       await dbLocal.sessoes.put({
-        id: String(sessao.id),
+        id: idStr,
         unidade: sessao.unidade,
         status: sessao.status,
         troco_inicial: Number(sessao.troco_inicial) || 0,
@@ -267,23 +331,34 @@ class SyncService {
   public async cacheVendas(vendasRaw: any[], sessaoId: string) {
     if (!vendasRaw || vendasRaw.length === 0) return;
     try {
-      const records: LocalVenda[] = vendasRaw.map(v => ({
-        id: String(v.id),
-        sessao_id: String(sessaoId),
-        unidade: v.unidade,
-        numero_sequencial: Number(v.numero_sequencial),
-        setor: v.setor,
-        valor: Number(v.valor),
-        quantidade: Number(v.quantidade || 1),
-        forma_pagto: v.forma_pagto,
-        observacao: v.observacao || '',
-        is_caixa_2: !!v.is_caixa_2,
-        criado_em: v.criado_em || new Date().toISOString(),
-        sync_status: 'synced'
-      }));
+      const sessaoIdStr = String(sessaoId);
+      const pendentesLocais = await dbLocal.vendas
+        .where('sessao_id')
+        .equals(sessaoIdStr)
+        .and(v => v.sync_status === 'pending')
+        .toArray();
+      const idsPendentes = new Set(pendentesLocais.map(v => String(v.id)));
 
-      // Inserção em massa rápida no Dexie
-      await dbLocal.vendas.bulkPut(records);
+      const records: LocalVenda[] = vendasRaw
+        .filter(v => !idsPendentes.has(String(v.id)))
+        .map(v => ({
+          id: String(v.id),
+          sessao_id: sessaoIdStr,
+          unidade: v.unidade,
+          numero_sequencial: Number(v.numero_sequencial),
+          setor: v.setor,
+          valor: Number(v.valor),
+          quantidade: Number(v.quantidade || 1),
+          forma_pagto: v.forma_pagto,
+          observacao: v.observacao || '',
+          is_caixa_2: !!v.is_caixa_2,
+          criado_em: v.criado_em || new Date().toISOString(),
+          sync_status: 'synced'
+        }));
+
+      if (records.length > 0) {
+        await dbLocal.vendas.bulkPut(records);
+      }
     } catch (e) {
       console.error('Erro ao salvar vendas em cache local:', e);
     }
@@ -291,4 +366,3 @@ class SyncService {
 }
 
 export const syncService = new SyncService();
-
